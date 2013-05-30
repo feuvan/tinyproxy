@@ -194,6 +194,7 @@ func (s *SmartProxy) HandleWebSocket(ctx *ProxyContext, w http.ResponseWriter, r
 func main() {
 	var port int
 	flag.StringVar(&host, "h", "proxy.localdomain", "Host used to identify proxy built-in web service")
+	ipv4Only := flag.Bool("4", true, "Listen on IPV4 only, required by Linux platform.")
 	flag.IntVar(&port, "p", 3128, "proxy listening port")
 	version := flag.Bool("v", false, "display build version")
 	flag.Usage = func() {
@@ -216,5 +217,20 @@ func main() {
 		MaxHeaderBytes: 1 << 20,
 	}
 
-	log.Println(s.ListenAndServe())
+	addr := s.Addr
+	if addr == "" {
+		addr = ":http"
+	}
+	l, e := net.Listen(
+		func() string {
+			if ipv4Only != nil && *ipv4Only {
+				return "tcp4"
+			} else {
+				return "tcp"
+			}
+		}(), addr)
+	if e != nil {
+		log.Panic(e)
+	}
+	log.Println(s.Serve(l))
 }
