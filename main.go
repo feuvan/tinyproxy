@@ -61,7 +61,7 @@ type ProxyContext struct {
 func (s *SmartProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := &ProxyContext{atomic.AddUint64(&s.counter, 1), nil, log.New(os.Stderr, "", 0)}
 	ctx.SetPrefix(fmt.Sprintf("[Core][%d][%v] ", ctx.counter, r.RemoteAddr))
-	ctx.Printf("%v", r.URL)
+	ctx.Printf("%v", r.RequestURI)
 
 	authStr := r.Header["Proxy-Authorization"]
 	if len(authStr) > 0 {
@@ -110,6 +110,10 @@ func (s *SmartProxy) HandlePlain(ctx *ProxyContext, w http.ResponseWriter, r *ht
 	}()
 
 	nr, err := http.NewRequest(r.Method, r.RequestURI, r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
 	for k, vs := range r.Header {
 		for _, v := range vs {
 			nr.Header.Add(k, v)
@@ -118,28 +122,26 @@ func (s *SmartProxy) HandlePlain(ctx *ProxyContext, w http.ResponseWriter, r *ht
 
 	defer r.Body.Close()
 	client := &http.Client{}
-	resp, err := client.Do(nr)
-	if err == nil {
+	if resp, err := client.Do(nr); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	} else {
 		for k, vs := range resp.Header {
 			for _, v := range vs {
 				w.Header().Add(k, v)
 			}
 		}
-		b := make([]byte, 0x1000)
-		for {
-			n, err := resp.Body.Read(b)
-			if n > 0 {
-				w.Write(b[0:n])
-			}
-			if err != nil || n == 0 {
-				if err != nil && err != io.EOF {
-					ctx.Printf("Error: %v, n= %d", err, n)
-				}
-				break
-			}
+		w.Header().Add("Proxy-Agent", Tag)
+		done := make(chan bool, 1)
+		go func() {
+			written, err := io.Copy(w, resp.Body)
+			ctx.Printf("Copied %d bytes from upstream[%v] to client[%v]. Error: %v", written, r.URL.Host, r.RemoteAddr, err)
+			done <- err == nil
+		}()
+
+		select {
+		case <-done:
 		}
-	} else {
-		http.Error(w, err.Error(), http.StatusBadGateway)
 	}
 }
 
@@ -161,24 +163,37 @@ func (s *SmartProxy) HandleHTTPS(ctx *ProxyContext, w http.ResponseWriter, r *ht
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	cc.Write([]byte(fmt.Sprintf("HTTP/%d.%d 200 OK\r\n\r\n", r.ProtoMajor, r.ProtoMinor)))
+	cc.Write([]byte(fmt.Sprintf("HTTP/%d.%d 200 Connection Established\r\n\r\n", r.ProtoMajor, r.ProtoMinor)))
 
 	conn, err := net.Dial("tcp", r.URL.Host)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	} else {
-		ctx.Printf("connected to %v", r.URL.Host)
+		ctx.Printf("connected to %v, remote addr: %v", r.URL.Host, conn.RemoteAddr())
 	}
 
+	done := make(chan bool, 2)
 	go func() {
 		written, err := io.Copy(conn, cc)
-		ctx.Printf("Copied %d bytes from client[%v] to upstream[%v]. Error: %v", written, cc.RemoteAddr(), conn.RemoteAddr(), err)
+		ctx.Printf("Copied %d bytes from client[%v] to upstream[%v]. Error: %v", written, cc.RemoteAddr(), r.URL.Host, err)
+		done <- err == nil
 	}()
 	go func() {
 		written, err := io.Copy(cc, conn)
-		ctx.Printf("Copied %d bytes from upstream[%v] to client[%v]. Error: %v", written, conn.RemoteAddr(), cc.RemoteAddr(), err)
+		ctx.Printf("Copied %d bytes from upstream[%v] to client[%v]. Error: %v", written, r.URL.Host, cc.RemoteAddr(), err)
+		done <- err == nil
 	}()
+	count := 0
+	for {
+		select {
+		case <-done:
+			count++
+			if count == 2 {
+				return
+			}
+		}
+	}
 }
 
 func (s *SmartProxy) HandleWebSocket(ctx *ProxyContext, w http.ResponseWriter, r *http.Request) {
@@ -211,9 +226,7 @@ func main() {
 
 	s := &http.Server{
 		Addr:           ":" + strconv.Itoa(port),
-		Handler:        &SmartProxy{0, 0},
-		ReadTimeout:    10 * time.Second,
-		WriteTimeout:   10 * time.Second,
+		Handler:        new(SmartProxy),
 		MaxHeaderBytes: 1 << 20,
 	}
 
@@ -221,9 +234,10 @@ func main() {
 	if addr == "" {
 		addr = ":http"
 	}
+
 	l, e := net.Listen(
 		func() string {
-			if ipv4Only != nil && *ipv4Only {
+			if *ipv4Only {
 				return "tcp4"
 			} else {
 				return "tcp"
@@ -232,5 +246,7 @@ func main() {
 	if e != nil {
 		log.Panic(e)
 	}
+	defer l.Close()
+
 	log.Println(s.Serve(l))
 }
