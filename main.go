@@ -8,10 +8,12 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 const (
@@ -20,7 +22,30 @@ const (
 
 var Tag = "Tiny Proxy"
 var host = ""
-var allowAnonymous = false
+var global = struct {
+	AllowAnonymous          bool
+	NoCaching               bool // Only for plain HTTP proxy. CONNECT proxy connections are untouched and won't affected by this parameter
+	UseProxyFromEnvironment bool
+	UpstreamDialTimeout     time.Duration // Dial timeout for upstream dial (including dns resolve and connect), default to 30 seconds. net.Dialer.Timeout
+}{
+	AllowAnonymous:          false,
+	NoCaching:               false,
+	UseProxyFromEnvironment: false,
+	UpstreamDialTimeout:     30 * time.Second, // usually used to close conection earlier for dumb or blocked address
+}
+
+var tr = &http.Transport{
+	Proxy: func() func(*http.Request) (*url.URL, error) {
+		if global.UseProxyFromEnvironment {
+			return http.ProxyFromEnvironment
+		} else {
+			return nil
+		}
+	}(),
+	Dial: func(network, addr string) (net.Conn, error) {
+		return net.DialTimeout(network, addr, global.UpstreamDialTimeout)
+	},
+}
 
 type SmartProxy struct {
 	counter   uint64
@@ -59,13 +84,12 @@ type ProxyContext struct {
 
 func (s *SmartProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := &ProxyContext{atomic.AddUint64(&s.counter, 1), nil, log.New(os.Stderr, "", 0)}
-	ctx.SetPrefix(fmt.Sprintf("[Core][%d][%v] ", ctx.counter, r.RemoteAddr))
-	ctx.Printf("%v", r.RequestURI)
+	ctx.SetPrefix(fmt.Sprintf("[Core][%d][%v] ", ctx.counter, r.Host))
+	ctx.Printf("proxy request %v %v", r.Method, r.RequestURI)
 
-	ctx.Printf("Current connected: %d", atomic.AddInt64(&s.connected, 1))
+	atomic.AddInt64(&s.connected, 1)
 	defer func() {
 		atomic.AddInt64(&s.connected, -1)
-		ctx.Printf("Proxy Done. Current connected: %d", s.connected)
 	}()
 
 	authStr := r.Header["Proxy-Authorization"]
@@ -74,7 +98,7 @@ func (s *SmartProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			auth := strings.SplitN(string(data), ":", 2)
 			if len(auth) == 2 {
 				ctx.User = &User{auth[0], auth[1]}
-				if !allowAnonymous && !ctx.User.Authorized() {
+				if !global.AllowAnonymous && !ctx.User.Authorized() {
 					w.Header().Set("Proxy-Authenticate", fmt.Sprintf(`Basic realm="%v on %v"`, Tag, host))
 					w.WriteHeader(http.StatusProxyAuthRequired)
 					return
@@ -90,7 +114,7 @@ func (s *SmartProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		r.Header.Del("Proxy-Authorization")
-	} else if !allowAnonymous {
+	} else if !global.AllowAnonymous {
 		w.Header().Set("Proxy-Authenticate", fmt.Sprintf(`Basic realm="%v on %v"`, Tag, host))
 		w.WriteHeader(http.StatusProxyAuthRequired)
 		return
@@ -107,31 +131,35 @@ func (s *SmartProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *SmartProxy) HandlePlain(ctx *ProxyContext, w http.ResponseWriter, r *http.Request) {
-	ctx.Logger.SetPrefix(fmt.Sprintf("[HTTP][%d][%v] ", ctx.counter, r.RemoteAddr))
-
-	nr, err := http.NewRequest(r.Method, r.RequestURI, r.Body)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	for k, vs := range r.Header {
-		for _, v := range vs {
-			nr.Header.Add(k, v)
-		}
-	}
+	ctx.Logger.SetPrefix(fmt.Sprintf("[HTTP][%d][%v][%v] ", ctx.counter, r.Method, r.Host))
 
 	defer r.Body.Close()
-	client := &http.Client{}
-	if resp, err := client.Do(nr); err != nil {
+
+	if global.NoCaching {
+		r.Header.Del("If-Modified-Since")
+		r.Header.Del("Cache-Control")
+	}
+
+	r.RequestURI = ""
+	if resp, err := tr.RoundTrip(r); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	} else {
+		defer resp.Body.Close()
+		if global.NoCaching {
+			resp.Header.Del("Expires")
+			resp.Header.Del("Last-Modified")
+			resp.Header.Del("Cache-Control")
+			resp.Header.Add("Cache-Control", "no-cache")
+		}
+
 		for k, vs := range resp.Header {
 			for _, v := range vs {
 				w.Header().Add(k, v)
 			}
 		}
 		w.Header().Add("Proxy-Agent", Tag)
+		w.WriteHeader(resp.StatusCode)
 		done := make(chan bool, 1)
 		go func() {
 			written, err := io.Copy(w, resp.Body)
@@ -143,7 +171,7 @@ func (s *SmartProxy) HandlePlain(ctx *ProxyContext, w http.ResponseWriter, r *ht
 }
 
 func (s *SmartProxy) HandleConnect(ctx *ProxyContext, w http.ResponseWriter, r *http.Request) {
-	ctx.Logger.SetPrefix(fmt.Sprintf("[CONN][%d][%v] ", ctx.counter, r.RemoteAddr))
+	ctx.Logger.SetPrefix(fmt.Sprintf("[CONN][%d][%v] ", ctx.counter, r.Host))
 
 	h, ok := w.(http.Hijacker)
 	if !ok {
@@ -158,9 +186,9 @@ func (s *SmartProxy) HandleConnect(ctx *ProxyContext, w http.ResponseWriter, r *
 	defer cc.Close()
 	cc.Write([]byte(fmt.Sprintf("HTTP/%d.%d 200 Connection Established\r\n\r\n", r.ProtoMajor, r.ProtoMinor)))
 
-	conn, err := net.Dial("tcp", r.URL.Host)
+	conn, err := net.DialTimeout("tcp", r.URL.Host, global.UpstreamDialTimeout)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		ctx.Println(err)
 		return
 	}
 	defer conn.Close()
