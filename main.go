@@ -62,6 +62,12 @@ func (s *SmartProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx.SetPrefix(fmt.Sprintf("[Core][%d][%v] ", ctx.counter, r.RemoteAddr))
 	ctx.Printf("%v", r.RequestURI)
 
+	ctx.Printf("Current connected: %d", atomic.AddInt64(&s.connected, 1))
+	defer func() {
+		atomic.AddInt64(&s.connected, -1)
+		ctx.Printf("Proxy Done. Current connected: %d", s.connected)
+	}()
+
 	authStr := r.Header["Proxy-Authorization"]
 	if len(authStr) > 0 {
 		if data, err := base64.StdEncoding.DecodeString(strings.TrimLeft(authStr[0], "Basic ")); err == nil {
@@ -70,31 +76,31 @@ func (s *SmartProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				ctx.User = &User{auth[0], auth[1]}
 				if !allowAnonymous && !ctx.User.Authorized() {
 					w.Header().Set("Proxy-Authenticate", fmt.Sprintf(`Basic realm="%v on %v"`, Tag, host))
-					http.Error(w, "", http.StatusProxyAuthRequired)
+					w.WriteHeader(http.StatusProxyAuthRequired)
 					return
 				}
 			} else {
 				w.Header().Set("Proxy-Authenticate", fmt.Sprintf(`Basic realm="%v on %v"`, Tag, host))
-				http.Error(w, "", http.StatusProxyAuthRequired)
+				w.WriteHeader(http.StatusProxyAuthRequired)
 				return
 			}
 		} else {
 			w.Header().Set("Proxy-Authenticate", fmt.Sprintf(`Basic realm="%v on %v"`, Tag, host))
-			http.Error(w, err.Error(), http.StatusProxyAuthRequired)
+			w.WriteHeader(http.StatusProxyAuthRequired)
 			return
 		}
 		r.Header.Del("Proxy-Authorization")
 	} else if !allowAnonymous {
 		w.Header().Set("Proxy-Authenticate", fmt.Sprintf(`Basic realm="%v on %v"`, Tag, host))
-		http.Error(w, "", http.StatusProxyAuthRequired)
+		w.WriteHeader(http.StatusProxyAuthRequired)
 		return
 	}
 	r.Header.Del("Proxy-Connection")
 
-	if r.Header.Get("Upgrade") == "websocket" {
+	if strings.ToLower(r.Header.Get("Upgrade")) == "websocket" {
 		s.HandleWebSocket(ctx, w, r)
 	} else if r.Method == "CONNECT" {
-		s.HandleHTTPS(ctx, w, r)
+		s.HandleConnect(ctx, w, r)
 	} else {
 		s.HandlePlain(ctx, w, r)
 	}
@@ -102,11 +108,6 @@ func (s *SmartProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (s *SmartProxy) HandlePlain(ctx *ProxyContext, w http.ResponseWriter, r *http.Request) {
 	ctx.Logger.SetPrefix(fmt.Sprintf("[HTTP][%d][%v] ", ctx.counter, r.RemoteAddr))
-	ctx.Printf("current connected: %d", atomic.AddInt64(&s.connected, 1))
-	defer func() {
-		atomic.AddInt64(&s.connected, -1)
-		ctx.Printf("Closed. current connected: %d", s.connected)
-	}()
 
 	nr, err := http.NewRequest(r.Method, r.RequestURI, r.Body)
 	if err != nil {
@@ -135,26 +136,18 @@ func (s *SmartProxy) HandlePlain(ctx *ProxyContext, w http.ResponseWriter, r *ht
 		go func() {
 			written, err := io.Copy(w, resp.Body)
 			ctx.Printf("Copied %d bytes from upstream[%v] to client[%v]. Error: %v", written, r.URL.Host, r.RemoteAddr, err)
-			done <- err == nil
+			done <- (err == nil)
 		}()
-
-		select {
-		case <-done:
-		}
+		<-done
 	}
 }
 
-func (s *SmartProxy) HandleHTTPS(ctx *ProxyContext, w http.ResponseWriter, r *http.Request) {
-	ctx.Logger.SetPrefix(fmt.Sprintf("[HTTPS][%d][%v] ", ctx.counter, r.RemoteAddr))
-	ctx.Printf("current connected: %d", atomic.AddInt64(&s.connected, 1))
-	defer func() {
-		atomic.AddInt64(&s.connected, -1)
-		ctx.Printf("Closed. current connected: %d", s.connected)
-	}()
+func (s *SmartProxy) HandleConnect(ctx *ProxyContext, w http.ResponseWriter, r *http.Request) {
+	ctx.Logger.SetPrefix(fmt.Sprintf("[CONN][%d][%v] ", ctx.counter, r.RemoteAddr))
 
 	h, ok := w.(http.Hijacker)
 	if !ok {
-		http.Error(w, "", http.StatusBadGateway)
+		http.Error(w, "webserver doesn't support hijacking", http.StatusBadGateway)
 		return
 	}
 	cc, _, err := h.Hijack()
@@ -162,46 +155,35 @@ func (s *SmartProxy) HandleHTTPS(ctx *ProxyContext, w http.ResponseWriter, r *ht
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
+	defer cc.Close()
 	cc.Write([]byte(fmt.Sprintf("HTTP/%d.%d 200 Connection Established\r\n\r\n", r.ProtoMajor, r.ProtoMinor)))
 
 	conn, err := net.Dial("tcp", r.URL.Host)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
-	} else {
-		ctx.Printf("connected to %v, remote addr: %v", r.URL.Host, conn.RemoteAddr())
 	}
+	defer conn.Close()
+	ctx.Printf("Connected to %v, remote addr: %v", r.URL.Host, conn.RemoteAddr())
 
-	done := make(chan bool, 2)
+	done := make(chan bool, 1)
 	go func() {
 		written, err := io.Copy(conn, cc)
 		ctx.Printf("Copied %d bytes from client[%v] to upstream[%v]. Error: %v", written, cc.RemoteAddr(), r.URL.Host, err)
-		done <- err == nil
+		done <- true
 	}()
 	go func() {
 		written, err := io.Copy(cc, conn)
 		ctx.Printf("Copied %d bytes from upstream[%v] to client[%v]. Error: %v", written, r.URL.Host, cc.RemoteAddr(), err)
-		done <- err == nil
+		done <- true
 	}()
-	count := 0
-	for {
-		select {
-		case <-done:
-			count++
-			if count == 2 {
-				return
-			}
-		}
+	for n := 0; n < 2; n++ {
+		<-done
 	}
 }
 
 func (s *SmartProxy) HandleWebSocket(ctx *ProxyContext, w http.ResponseWriter, r *http.Request) {
 	ctx.Logger.SetPrefix(fmt.Sprintf("[WebSocket][%d][%v] ", ctx.counter, r.RemoteAddr))
-	ctx.Printf("current connected: %d", atomic.AddInt64(&s.connected, 1))
-	defer func() {
-		atomic.AddInt64(&s.connected, -1)
-		ctx.Printf("Closed. current connected: %d", s.connected)
-	}()
 	http.Error(w, "Unimplemented WebSocket proxy", http.StatusMethodNotAllowed)
 }
 
