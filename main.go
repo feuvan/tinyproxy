@@ -84,8 +84,8 @@ type ProxyContext struct {
 
 func (s *SmartProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := &ProxyContext{atomic.AddUint64(&s.counter, 1), nil, log.New(os.Stderr, "", 0)}
-	ctx.SetPrefix(fmt.Sprintf("[Core][%d][%v] ", ctx.counter, r.Host))
-	ctx.Printf("proxy request %v %v", r.Method, r.RequestURI)
+	ctx.SetPrefix(fmt.Sprintf("[Core][%d/%d][%v][%v] ", ctx.counter, s.connected, r.RemoteAddr, r.Host))
+	ctx.Println(r.Method, r.RequestURI)
 
 	atomic.AddInt64(&s.connected, 1)
 	defer func() {
@@ -120,18 +120,17 @@ func (s *SmartProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Header.Del("Proxy-Connection")
-
-	if strings.ToLower(r.Header.Get("Upgrade")) == "websocket" {
-		s.HandleWebSocket(ctx, w, r)
-	} else if r.Method == "CONNECT" {
+	if r.Method == "CONNECT" {
 		s.HandleConnect(ctx, w, r)
+	} else if strings.ToLower(r.Header.Get("Upgrade")) == "websocket" {
+		s.HandleWebSocketUpgrade(ctx, w, r)
 	} else {
 		s.HandlePlain(ctx, w, r)
 	}
 }
 
 func (s *SmartProxy) HandlePlain(ctx *ProxyContext, w http.ResponseWriter, r *http.Request) {
-	ctx.Logger.SetPrefix(fmt.Sprintf("[HTTP][%d][%v][%v] ", ctx.counter, r.Method, r.Host))
+	ctx.Logger.SetPrefix(fmt.Sprintf("[HTTP][%d][%v][%v][%v] ", ctx.counter, r.RemoteAddr, r.Method, r.Host))
 
 	defer r.Body.Close()
 
@@ -163,7 +162,7 @@ func (s *SmartProxy) HandlePlain(ctx *ProxyContext, w http.ResponseWriter, r *ht
 		done := make(chan bool, 1)
 		go func() {
 			written, err := io.Copy(w, resp.Body)
-			ctx.Printf("Copied %d bytes from upstream[%v] to client[%v]. Error: %v", written, r.URL.Host, r.RemoteAddr, err)
+			ctx.Printf("Copied %d bytes from upstream[%v] to client[%v]. Error: %v", written, r.Host, r.RemoteAddr, err)
 			done <- (err == nil)
 		}()
 		<-done
@@ -171,7 +170,7 @@ func (s *SmartProxy) HandlePlain(ctx *ProxyContext, w http.ResponseWriter, r *ht
 }
 
 func (s *SmartProxy) HandleConnect(ctx *ProxyContext, w http.ResponseWriter, r *http.Request) {
-	ctx.Logger.SetPrefix(fmt.Sprintf("[CONN][%d][%v] ", ctx.counter, r.Host))
+	ctx.Logger.SetPrefix(fmt.Sprintf("[CONN][%d][%v][%v] ", ctx.counter, r.RemoteAddr, r.Host))
 
 	h, ok := w.(http.Hijacker)
 	if !ok {
@@ -186,23 +185,23 @@ func (s *SmartProxy) HandleConnect(ctx *ProxyContext, w http.ResponseWriter, r *
 	defer cc.Close()
 	cc.Write([]byte(fmt.Sprintf("HTTP/%d.%d 200 Connection Established\r\n\r\n", r.ProtoMajor, r.ProtoMinor)))
 
-	conn, err := net.DialTimeout("tcp", r.URL.Host, global.UpstreamDialTimeout)
+	uc, err := net.DialTimeout("tcp", r.Host, global.UpstreamDialTimeout)
 	if err != nil {
 		ctx.Println(err)
 		return
 	}
-	defer conn.Close()
-	ctx.Printf("Connected to %v, remote addr: %v", r.URL.Host, conn.RemoteAddr())
+	defer uc.Close()
+	ctx.Printf("Connected to upstream %v, addr: %v", r.Host, uc.RemoteAddr())
 
 	done := make(chan bool, 1)
 	go func() {
-		written, err := io.Copy(conn, cc)
-		ctx.Printf("Copied %d bytes from client[%v] to upstream[%v]. Error: %v", written, cc.RemoteAddr(), r.URL.Host, err)
+		written, err := io.Copy(uc, cc)
+		ctx.Printf("Copied %d bytes from client[%v] to upstream[%v]. Error: %v", written, cc.RemoteAddr(), r.Host, err)
 		done <- true
 	}()
 	go func() {
-		written, err := io.Copy(cc, conn)
-		ctx.Printf("Copied %d bytes from upstream[%v] to client[%v]. Error: %v", written, r.URL.Host, cc.RemoteAddr(), err)
+		written, err := io.Copy(cc, uc)
+		ctx.Printf("Copied %d bytes from upstream[%v] to client[%v]. Error: %v", written, r.Host, cc.RemoteAddr(), err)
 		done <- true
 	}()
 	for n := 0; n < 2; n++ {
@@ -210,9 +209,10 @@ func (s *SmartProxy) HandleConnect(ctx *ProxyContext, w http.ResponseWriter, r *
 	}
 }
 
-func (s *SmartProxy) HandleWebSocket(ctx *ProxyContext, w http.ResponseWriter, r *http.Request) {
+func (s *SmartProxy) HandleWebSocketUpgrade(ctx *ProxyContext, w http.ResponseWriter, r *http.Request) {
 	ctx.Logger.SetPrefix(fmt.Sprintf("[WebSocket][%d][%v] ", ctx.counter, r.RemoteAddr))
-	http.Error(w, "Unimplemented WebSocket proxy", http.StatusMethodNotAllowed)
+	http.Error(w, "Unimplemented WebSocket Upgrade proxy. Expect modern WS implementation to CONNECT directly.", http.StatusMethodNotAllowed)
+	ctx.Println("Unimplemented WebSocket Upgrade proxy")
 }
 
 func main() {
